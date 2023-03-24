@@ -1,0 +1,151 @@
+##########################################################
+### Packages
+import pyspark.sql.functions as F
+from pyspark.sql.types import StructType, StringType, FloatType, DoubleType
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+#import statsmodels.api as sm
+from pyspark.ml.stat import Correlation
+from pyspark.ml.feature import VectorAssembler
+from optbinning import OptimalBinning
+pd.set_option('display.float_format', lambda x: '%.8f' % x)
+pd.set_option('display.max_columns', None)
+
+##########################################################
+### Variable selection based on document
+def bivariate_analysis(mBehav, dIV_threshold, dStart_date, dEnd_date, write_corr, write_vTarget, write_IVs, write_buckets, write_drop):
+  mBehav = mBehav.filter(mBehav['ReportingMonth'] >= dStart_date)
+  mBehav = mBehav.filter(mBehav['ReportingMonth'] <= dEnd_date)
+  vTarget = mBehav.select('BAD_original_EBA')
+  vTarget = vTarget.toPandas().squeeze()
+  vTarget = vTarget.rename('BAD_original_EBA')
+  mBehav = mBehav.drop('BAD_original_EBA', 'ReportingMonth')
+
+  # create dictionaries 
+  d = {}
+  Var_drop = {}
+  vIV = {}
+  mCorr = spark.createDataFrame(pd.DataFrame(range(mBehav.count()), columns = ['index']))
+  
+  # Optimal binning of categorical values
+  for ivars, dtype in mBehav.dtypes:
+    if dtype == 'string':
+      x = mBehav.select(ivars).toPandas()
+      x = x.squeeze().values
+      optb = OptimalBinning(name=ivars, dtype="categorical", solver="mip", monotonic_trend="auto_asc_desc", min_n_bins = 2)
+      optb.fit(x, vTarget)
+      binning_table = optb.binning_table
+      print(ivars)
+      print(binning_table.build())
+      binning_table.plot(metric = 'event_rate')
+      if binning_table.build()['IV'].iloc[-1] > dIV_threshold:
+        Var_drop[ivars] = pd.DataFrame(binning_table.build()['Bin'][:-3]).join(binning_table.build()['WoE'][:-3].astype({'WoE' : 'float64'}), how = 'left').loc[pd.DataFrame(binning_table.build()['Bin'][:-3]).join(binning_table.build()['WoE'][:-3].astype({'WoE' : 'float64'}), how = 'left')['WoE'].idxmin()]['Bin']
+
+        # Create values per bucket for correlation analysis
+        df = pd.DataFrame({ivars: optb.transform(x, metric="bins")}, index = vTarget.index)
+        df.reset_index(drop = False, inplace = True)
+        df = spark.createDataFrame(df)
+        mCorr = mCorr.join(df, ['index'], 'left')
+
+        # Create IV dataframe
+        vIV[ivars] = pd.DataFrame((binning_table.build()['IV'][-1:]).values, columns = ['IV'])
+
+        # Build table with bucketnrs
+        d[ivars] = pd.DataFrame(binning_table.build()['Bin'][:-3]).join(pd.DataFrame(binning_table.build()['Event rate'][:-3]), how = 'left')
+        d[ivars].set_index('Bin', inplace = True)
+        d[ivars].index = d[ivars].index.map(str)
+      else:
+        pass
+    
+    # Optimal binning of numerical values
+    else:
+      x = mBehav.select(ivars).toPandas()
+      x = x.squeeze().values
+      optb = OptimalBinning(name=ivars, dtype="numerical", solver="cp", monotonic_trend="auto_asc_desc", min_n_bins =2)
+      optb.fit(x, vTarget)
+      binning_table = optb.binning_table
+      print(ivars)
+      print(binning_table.build())
+      binning_table.plot(metric = 'event_rate')
+      if binning_table.build()['IV'].iloc[-1] > dIV_threshold:
+        Var_drop[ivars] = pd.DataFrame(binning_table.build()['Bin'][:-3]).join(binning_table.build()['WoE'][:-3].astype({'WoE' : 'float64'}), how = 'left').loc[pd.DataFrame(binning_table.build()['Bin'][:-3]).join(binning_table.build()['WoE'][:-3].astype({'WoE' : 'float64'}), how = 'left')['WoE'].idxmin()]['Bin']
+
+        # Create values per bucket for correlation analysis
+        df = pd.DataFrame({ivars: optb.transform(x, metric="bins")}, index = vTarget.index)
+        df.reset_index(drop = False, inplace = True)
+        df = spark.createDataFrame(df)
+        mCorr = mCorr.join(df, ['index'], 'left')
+
+        # Create IV dataframe
+        vIV[ivars] = pd.DataFrame((binning_table.build()['IV'][-1:]).values, columns = ['IV'])
+
+        # Build table with bucketnrs
+        d[ivars] = pd.DataFrame(binning_table.build()['Bin'][:-3]).join(pd.DataFrame(binning_table.build()['Event rate'][:-3]), how = 'left')
+        d[ivars].set_index('Bin', inplace = True)
+        d[ivars].index = d[ivars].index.map(str)
+      else:
+        pass
+  
+#   # Export grouped correlation data
+  if write_corr == True:
+    mCorr.write.mode("overwrite").parquet('abfss://userroot@mscstaaimlanacc03.dfs.core.windows.net/ws-md-pd-r/Behavioural module/2. Bucketing/Correlation_data.parquet')
+#   # Export default flag
+  if write_vTarget == True:
+    spark.createDataFrame(vTarget, FloatType()).write.mode("overwrite").parquet('abfss://userroot@mscstaaimlanacc03.dfs.core.windows.net/ws-md-pd-r/Behavioural module/2. Bucketing/vTarget.parquet')
+  
+  # Group all IVs together and export
+  if write_IVs == True:
+    vIV = pd.concat(vIV, axis = 1)
+    vIV.columns = vIV.columns.get_level_values(0)
+    vIV = vIV.T
+    vIV.columns = ['IV']
+    vIV.reset_index(drop = False, inplace = True)
+    vIV = spark.createDataFrame(vIV)
+    outFilePath = 'abfss://userroot@mscstaaimlanacc03.dfs.core.windows.net/ws-md-pd-r/Behavioural module/2. Bucketing/IV.csv'
+    vIV.coalesce(1).write.options(header = True, delimiter = ';').format("csv").mode("overwrite").save(outFilePath)
+    
+  # Group all default rate and bucketnr dataframes into 1 dataframe and export
+  if write_buckets == True:
+    mDefault_bucket = pd.concat(d.values(), keys=d.keys())
+    mDefault_bucket.index = mDefault_bucket.index.map('_'.join)
+    mDefault_bucket.reset_index(drop = False, inplace = True)
+    mDefault_bucket = spark.createDataFrame(mDefault_bucket)
+    outFilePath = 'abfss://userroot@mscstaaimlanacc03.dfs.core.windows.net/ws-md-pd-r/Behavioural module/2. Bucketing/Behav_buckets.csv' 
+    mDefault_bucket.coalesce(1).write.options(header = True, delimiter = ';').format("csv").mode("overwrite").save(outFilePath)
+  
+  # Remove dummy variables to avoid dummy variable trap and export
+  if write_drop == True:
+    mVar_drop = pd.DataFrame(Var_drop.items())
+    mVar_drop[1] = mVar_drop[1].astype(str)
+    mVar_drop['Drop'] = mVar_drop[0].astype(str) + '_' + mVar_drop[1].astype(str)
+    vVar_drop = mVar_drop['Drop'].to_list()
+    vVar_drop = spark.createDataFrame(vVar_drop, StringType())
+    outFilePath = 'abfss://userroot@mscstaaimlanacc03.dfs.core.windows.net/ws-md-pd-r/Behavioural module/2. Bucketing/Var_drop.csv'
+    vVar_drop.coalesce(1).write.options(header = True, delimiter = ';').format("csv").mode("overwrite").save(outFilePath)
+  return 
+     
+###########################################################
+### Main function    
+def main():
+    # Magic Numbers
+    mBehav = spark.read.option("MergeSchema", "true").parquet("abfss://userroot@mscstaaimlanacc03.dfs.core.windows.net/ws-md-pd-r/Behavioural module/1. Cleaning & Filtering/Behavioural_data_t.parquet/")
+    #TESTING WITH LINDI'S INPUT
+    #mBehav = spark.read.option("MergeSchema", "true").parquet('abfss://userroot@mscstaaimlanacc03.dfs.core.windows.net/ws-md-pd-r//Behavioural module/1. Cleaning & Filtering/Behavioural_data_LS2.parquet')
+    dIV_threshold = 0.02
+    dStart_date = 201609
+    dEnd_date = 202108
+    write_corr = True
+    write_vTarget = True
+    write_IVs = True
+    write_buckets = True
+    write_drop = True
+    # Initialisation
+    bivariate_analysis(mBehav, dIV_threshold, dStart_date, dEnd_date, write_corr, write_vTarget, write_IVs, write_buckets, write_drop)
+    # Output
+
+###########################################################
+### start main
+if __name__ == "__main__":
+    main()
